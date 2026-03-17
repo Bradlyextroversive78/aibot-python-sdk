@@ -39,6 +39,11 @@ from wecom_aibot.types.api import (
     SendMarkdownMsgBody,
     SendTemplateCardMsgBody,
     WSClientEventMap,
+    # 媒体上传类型
+    WeComMediaType,
+    VideoOptions,
+    UploadMediaOptions,
+    UploadMediaFinishResult,
 )
 from wecom_aibot.types.template_card import (
     TemplateCardType,
@@ -100,6 +105,11 @@ __all__ = [
     "SendMarkdownMsgBody",
     "SendTemplateCardMsgBody",
     "WSClientEventMap",
+    # 媒体上传类型
+    "WeComMediaType",
+    "VideoOptions",
+    "UploadMediaOptions",
+    "UploadMediaFinishResult",
     # Template card types
     "TemplateCardType",
     "TemplateCard",

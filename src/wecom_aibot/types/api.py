@@ -21,6 +21,10 @@ class WsCmd(StrEnum):
     SEND_MSG = "aibot_send_msg"
     CALLBACK = "aibot_msg_callback"
     EVENT_CALLBACK = "aibot_event_callback"
+    # 上传相关命令
+    UPLOAD_MEDIA_INIT = "aibot_upload_media_init"
+    UPLOAD_MEDIA_CHUNK = "aibot_upload_media_chunk"
+    UPLOAD_MEDIA_FINISH = "aibot_upload_media_finish"
 
 
 @dataclass
@@ -87,6 +91,11 @@ class StreamReplyBody:
         if finish:
             stream["finish"] = True
         if msg_item:
+            # 调试：打印 msg_item 内容
+            for i, item in enumerate(msg_item):
+                print(f"[DEBUG] msg_item[{i}]: msgtype={item.msgtype}, image.keys={list(item.image.keys()) if item.image else 'None'}")
+                if item.image and "base64" in item.image:
+                    print(f"[DEBUG]   base64长度: {len(item.image['base64'])}, md5: {item.image.get('md5', 'N/A')[:16]}...")
             stream["msg_item"] = [{"msgtype": item.msgtype, "image": item.image} for item in msg_item]
         if feedback:
             stream["feedback"] = {"id": feedback.id}
@@ -164,3 +173,47 @@ class WSClientEventMap:
     disconnected: DisconnectedCallback | None = None
     reconnecting: ReconnectingCallback | None = None
     error: ErrorCallback | None = None
+
+
+# ========== 媒体消息类型 ==========
+
+WeComMediaType = Literal["file", "image", "voice", "video"]
+
+
+@dataclass
+class VideoOptions:
+    """视频消息选项"""
+    title: str | None = None
+    description: str | None = None
+
+
+@dataclass
+class UploadMediaOptions:
+    """上传素材选项"""
+    type: WeComMediaType
+    filename: str
+
+    def __post_init__(self):
+        """验证必填字段"""
+        if not self.filename or not self.filename.strip():
+            raise ValueError("filename 不能为空")
+        valid_types = ("file", "image", "voice", "video")
+        if self.type not in valid_types:
+            raise ValueError(f"type 必须是 {valid_types} 之一，实际为: {self.type}")
+
+
+@dataclass
+class UploadMediaFinishResult:
+    """上传完成结果"""
+    type: WeComMediaType
+    media_id: str
+    created_at: str
+
+    @classmethod
+    def from_response(cls, body: dict) -> "UploadMediaFinishResult":
+        """从 API 响应创建实例"""
+        return cls(
+            type=body.get("type"),
+            media_id=body.get("media_id"),
+            created_at=body.get("created_at"),
+        )

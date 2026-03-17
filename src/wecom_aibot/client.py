@@ -5,6 +5,9 @@ WebSocket 客户端
 
 from __future__ import annotations
 import asyncio
+import base64
+import hashlib
+import math
 from typing import Any, Literal
 from pyee.asyncio import AsyncIOEventEmitter
 
@@ -21,6 +24,11 @@ from wecom_aibot.types import (
     WelcomeTemplateCardReplyBody,
     SendMarkdownMsgBody,
     SendTemplateCardMsgBody,
+    # 媒体上传类型
+    WeComMediaType,
+    VideoOptions,
+    UploadMediaOptions,
+    UploadMediaFinishResult,
 )
 from wecom_aibot.types.api import WsCmd
 from wecom_aibot.ws_manager import WsConnectionManager
@@ -28,6 +36,12 @@ from wecom_aibot.api_client import WeComApiClient
 from wecom_aibot.message_handler import MessageHandler
 from wecom_aibot.logger import DefaultLogger
 from wecom_aibot.utils import generate_req_id
+from wecom_aibot.exceptions import (
+    UploadError,
+    UploadInitError,
+    UploadFinishError,
+    ChunkUploadError,
+)
 
 
 class WSClient(AsyncIOEventEmitter):
@@ -152,6 +166,16 @@ class WSClient(AsyncIOEventEmitter):
         req_id = frame.headers.get("req_id", "")
         if isinstance(body, StreamReplyBody):
             body_data = {"msgtype": body.msgtype, "stream": body.stream}
+            # 调试：检查 stream 中是否有 msg_item
+            if "msg_item" in body.stream:
+                self._logger.debug(f"[SEND] stream 包含 msg_item, 数量: {len(body.stream['msg_item'])}")
+                for i, item in enumerate(body.stream['msg_item']):
+                    self._logger.debug(f"[SEND] msg_item[{i}]: {list(item.keys())}")
+                    if 'image' in item:
+                        img = item['image']
+                        self._logger.debug(f"[SEND]   image keys: {list(img.keys()) if isinstance(img, dict) else type(img)}")
+                        if isinstance(img, dict) and 'base64' in img:
+                            self._logger.debug(f"[SEND]   base64 长度: {len(img['base64'])}, md5 前16位: {img.get('md5', 'N/A')[:16]}")
         else:
             body_data = body
 
@@ -287,7 +311,19 @@ class WSClient(AsyncIOEventEmitter):
         if finish:
             body["stream"]["finish"] = True
         if msg_item:
-            body["stream"]["msg_item"] = [{"msgtype": item.msgtype, "image": item.image} for item in msg_item]
+            # 序列化 msg_item，确保图片数据正确
+            serialized_items = []
+            for item in msg_item:
+                item_dict = {"msgtype": item.msgtype}
+                if hasattr(item, 'image') and item.image:
+                    # 确保 image 是字典格式
+                    if hasattr(item.image, '__dict__'):
+                        item_dict["image"] = item.image.__dict__
+                    else:
+                        item_dict["image"] = item.image
+                serialized_items.append(item_dict)
+            body["stream"]["msg_item"] = serialized_items
+            self._logger.debug(f"msg_item 序列化结果: msgtype={serialized_items[0]['msgtype']}, image_keys={list(serialized_items[0].get('image', {}).keys())}")
         if stream_feedback:
             body["stream"]["feedback"] = {"id": stream_feedback.id}
 
@@ -391,6 +427,228 @@ class WSClient(AsyncIOEventEmitter):
             ```
         """
         return await self._api_client.download_file(url, aes_key)
+
+    async def uploadMedia(
+        self,
+        file_bytes: bytes,
+        options: UploadMediaOptions,
+    ) -> UploadMediaFinishResult:
+        """
+        上传临时素材（三步分片上传）
+
+        通过 WebSocket 长连接执行分片上传：init → chunk × N → finish
+
+        Args:
+            file_bytes: 文件字节数据
+            options: 上传选项（类型、文件名）
+
+        Returns:
+            上传结果，包含 media_id（3天内有效）
+
+        Raises:
+            UploadInitError: 上传初始化失败
+            ChunkUploadError: 分片上传失败
+            UploadFinishError: 上传完成失败
+            UploadError: 其他上传失败
+        """
+        total_size = len(file_bytes)
+
+        # 分片大小：512KB（Base64 编码前）
+        CHUNK_SIZE = 512 * 1024
+        total_chunks = math.ceil(total_size / CHUNK_SIZE) if total_size > 0 else 0
+
+        if total_chunks > 100:
+            raise UploadError(f"File too large: {total_chunks} chunks exceeds maximum of 100 chunks (max ~50MB)")
+
+        # 计算文件 MD5
+        md5 = hashlib.md5(file_bytes).hexdigest()
+
+        self._logger.info(f"Uploading media: type={options.type}, filename={options.filename}, size={total_size}, chunks={total_chunks}")
+
+        # Step 1: 初始化上传
+        init_req_id = generate_req_id("upload_init")
+        init_result = await self._ws_manager.send_reply(
+            init_req_id,
+            {
+                "type": options.type,
+                "filename": options.filename,
+                "total_size": total_size,
+                "total_chunks": total_chunks,
+                "md5": md5,
+            },
+            WsCmd.UPLOAD_MEDIA_INIT,
+        )
+
+        upload_id = init_result.body.get("upload_id") if init_result.body else None
+        if not upload_id:
+            raise UploadInitError(f"Upload init failed: no upload_id returned. Response: {init_result}")
+
+        self._logger.info(f"Upload init success: upload_id={upload_id}")
+
+        # Step 2: 分片上传（带重试，根据分片数动态调整并发）
+        MAX_CHUNK_RETRIES = 2
+        # 动态并发数：1~4分片全并发，5~10分片并发3，>10分片并发2
+        if total_chunks <= 4:
+            MAX_CONCURRENCY = total_chunks
+        elif total_chunks <= 10:
+            MAX_CONCURRENCY = 3
+        else:
+            MAX_CONCURRENCY = 2
+
+        async def upload_chunk(chunk_index: int) -> None:
+            start = chunk_index * CHUNK_SIZE
+            end = min(start + CHUNK_SIZE, total_size)
+            chunk = file_bytes[start:end]
+            base64_data = base64.b64encode(chunk).decode("utf-8")
+
+            last_error = None
+            for attempt in range(MAX_CHUNK_RETRIES + 1):
+                try:
+                    chunk_req_id = generate_req_id("upload_chunk")
+                    await self._ws_manager.send_reply(
+                        chunk_req_id,
+                        {
+                            "upload_id": upload_id,
+                            "chunk_index": chunk_index,
+                            "base64_data": base64_data,
+                        },
+                        WsCmd.UPLOAD_MEDIA_CHUNK,
+                    )
+                    self._logger.debug(f"Uploaded chunk {chunk_index + 1}/{total_chunks} ({len(chunk)} bytes)")
+                    return
+                except Exception as err:
+                    last_error = err
+                    if attempt < MAX_CHUNK_RETRIES:
+                        delay = 500 * (attempt + 1)
+                        self._logger.warn(
+                            f"Chunk {chunk_index} upload failed (attempt {attempt + 1}/{MAX_CHUNK_RETRIES + 1}), "
+                            f"retrying in {delay}ms... error: {err}"
+                        )
+                        await asyncio.sleep(delay / 1000)
+
+            raise ChunkUploadError(
+                chunk_index=chunk_index,
+                attempts=MAX_CHUNK_RETRIES + 1,
+                message=str(last_error) if last_error else "Unknown error",
+            )
+
+        self._logger.debug(f"Upload concurrency: {MAX_CONCURRENCY} workers for {total_chunks} chunks")
+
+        if total_chunks <= 1:
+            # 单分片直接上传
+            await upload_chunk(0)
+        else:
+            # 多分片并发上传
+            next_index = 0
+            errors: list[Exception] = []
+
+            async def run_worker() -> None:
+                nonlocal next_index
+                while next_index < total_chunks:
+                    idx = next_index
+                    next_index += 1
+                    try:
+                        await upload_chunk(idx)
+                    except Exception as err:
+                        errors.append(err)
+
+            worker_count = min(MAX_CONCURRENCY, total_chunks)
+            await asyncio.gather(*[run_worker() for _ in range(worker_count)])
+
+            if errors:
+                raise UploadError(f"Upload failed: {len(errors)} chunk(s) failed. First error: {errors[0]}")
+
+        self._logger.info(f"All {total_chunks} chunks uploaded, finishing...")
+
+        # Step 3: 完成上传
+        finish_req_id = generate_req_id("upload_finish")
+        finish_result = await self._ws_manager.send_reply(
+            finish_req_id,
+            {"upload_id": upload_id},
+            WsCmd.UPLOAD_MEDIA_FINISH,
+        )
+
+        media_id = finish_result.body.get("media_id") if finish_result.body else None
+        if not media_id:
+            raise UploadFinishError(f"Upload finish failed: no media_id returned. Response: {finish_result}")
+
+        self._logger.info(f"Upload complete: media_id={media_id}, type={finish_result.body.get('type')}")
+
+        return UploadMediaFinishResult.from_response(finish_result.body)
+
+    async def replyMedia(
+        self,
+        frame: WsFrameHeaders,
+        media_type: WeComMediaType,
+        media_id: str,
+        video_options: VideoOptions | None = None,
+    ) -> WsFrame:
+        """
+        被动回复媒体消息
+
+        通过 aibot_respond_msg 被动回复通道发送媒体消息
+
+        Args:
+            frame: 收到的原始 WebSocket 帧
+            media_type: 媒体类型（file/image/voice/video）
+            media_id: 临时素材 media_id
+            video_options: 视频消息可选参数（仅 media_type='video' 时生效）
+
+        Returns:
+            回执帧
+        """
+        media_content: dict[str, Any] = {"media_id": media_id}
+        if media_type == "video" and video_options:
+            if video_options.title:
+                media_content["title"] = video_options.title
+            if video_options.description:
+                media_content["description"] = video_options.description
+
+        body: dict[str, Any] = {
+            "msgtype": media_type,
+            media_type: media_content,
+        }
+        return await self.reply(frame, body)
+
+    async def sendMediaMessage(
+        self,
+        chatid: str,
+        media_type: WeComMediaType,
+        media_id: str,
+        video_options: VideoOptions | None = None,
+    ) -> WsFrame:
+        """
+        主动发送媒体消息
+
+        通过 aibot_send_msg 主动推送通道发送媒体消息
+
+        Args:
+            chatid: 会话 ID（单聊填 userid，群聊填 chatid）
+            media_type: 媒体类型（file/image/voice/video）
+            media_id: 临时素材 media_id
+            video_options: 视频消息可选参数（仅 media_type='video' 时生效）
+
+        Returns:
+            回执帧
+        """
+        media_content: dict[str, Any] = {"media_id": media_id}
+        if media_type == "video" and video_options:
+            if video_options.title:
+                media_content["title"] = video_options.title
+            if video_options.description:
+                media_content["description"] = video_options.description
+
+        body: dict[str, Any] = {
+            "msgtype": media_type,
+            media_type: media_content,
+        }
+
+        req_id = generate_req_id("send_media")
+        full_body = {
+            "chatid": chatid,
+            **body,
+        }
+        return await self._ws_manager.send_reply(req_id, full_body, WsCmd.SEND_MSG)
 
     @property
     def is_connected(self) -> bool:

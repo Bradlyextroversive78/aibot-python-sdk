@@ -13,6 +13,17 @@ from wecom_aibot.types import (
     WSClientOptions,
     WsFrame,
     Logger,
+    # 媒体上传类型
+    WeComMediaType,
+    VideoOptions,
+    UploadMediaOptions,
+    UploadMediaFinishResult,
+)
+from wecom_aibot.exceptions import (
+    UploadError,
+    UploadInitError,
+    UploadFinishError,
+    ChunkUploadError,
 )
 
 __version__ = "0.1.0"
@@ -30,4 +41,14 @@ __all__ = [
     "WSClientOptions",
     "WsFrame",
     "Logger",
+    # Media upload types
+    "WeComMediaType",
+    "VideoOptions",
+    "UploadMediaOptions",
+    "UploadMediaFinishResult",
+    # Exceptions
+    "UploadError",
+    "UploadInitError",
+    "UploadFinishError",
+    "ChunkUploadError",
 ]
