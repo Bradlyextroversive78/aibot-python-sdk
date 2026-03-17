@@ -362,7 +362,7 @@ class WsConnectionManager:
         except Exception as e:
             self.logger.error(f"发送消息失败: {e}")
 
-    async def send_reply(self, req_id: str, body: Any, cmd: str = WsCmd.RESPONSE) -> "asyncio.Future[WsFrame]":
+    async def send_reply(self, req_id: str, body: Any, cmd: str = WsCmd.RESPONSE) -> WsFrame:
         """
         通过 WebSocket 通道发送回复消息（串行队列版本）
 
@@ -375,16 +375,14 @@ class WsConnectionManager:
             cmd: 发送的命令类型，默认 aibot_respond_msg
 
         Returns:
-            Future，收到回执时 resolve(回执帧)，超时或 errcode 非 0 时 reject(Error)
-        """
+            WsFrame，收到回执时返回回执帧，        """
         loop = asyncio.get_event_loop()
         future: asyncio.Future[WsFrame] = loop.create_future()
 
         # 检查队列大小
         queue = self._reply_queues.get(req_id, [])
         if len(queue) >= self.MAX_REPLY_QUEUE_SIZE:
-            future.set_exception(Exception(f"回复队列已满，最大长度: {self.MAX_REPLY_QUEUE_SIZE}"))
-            return future
+            raise Exception(f"回复队列已满，最大长度: {self.MAX_REPLY_QUEUE_SIZE}")
 
         # 添加到队列
         item = ReplyQueueItem(body=body, cmd=cmd, future=future)
@@ -395,7 +393,8 @@ class WsConnectionManager:
         if len(queue) == 1:
             await self._process_reply_queue(req_id)
 
-        return future
+        # 等待 Future 完成
+        return await future
 
     async def _process_reply_queue(self, req_id: str) -> None:
         """处理指定 req_id 的回复队列"""
